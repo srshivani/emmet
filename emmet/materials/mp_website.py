@@ -1,15 +1,19 @@
-from datetime import datetime
 import os
+import os.path
 import string
 import traceback
 import copy
 import nltk
 import numpy as np
 from ast import literal_eval
+from datetime import datetime
+from itertools import groupby
 
 from monty.json import jsanitize
+from monty.serialization import loadfn
 
-from maggma.builder import Builder
+from maggma.builders import Builder
+from maggma.utils import grouper, source_keys_updated
 from maggma.validator import JSONSchemaValidator, msonable_schema
 from pydash.objects import get, set_, has
 
@@ -17,278 +21,283 @@ from emmet.materials.snls import mp_default_snl_fields
 from emmet.common.utils import scrub_class_and_module
 from emmet import __version__ as emmet_version
 
-# Import for crazy things this builder needs
+from pymatgen import Structure
 from pymatgen.io.cif import CifWriter
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-from pymatgen import Structure
 from pymatgen.analysis.structure_analyzer import oxide_type
 from pymatgen.analysis.structure_analyzer import RelaxationAnalyzer
 from pymatgen.analysis.diffraction.core import DiffractionPattern
-from pymatgen.analysis.magnetism import CollinearMagneticStructureAnalyzer
 from pymatgen.util.provenance import StructureNL
 from pymatgen import __version__ as pymatgen_version
 
 __author__ = "Shyam Dwaraknath <shyamd@lbl.gov>"
 
-module_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+MODULE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+MPBUILDER_SCHEMA = os.path.join(MODULE_DIR, "schema", "mp_website.json")
+MPBUILDER_SETTINGS = os.path.join(MODULE_DIR, "settings", "mp_website.json")
 
-mp_conversion_dict = {
-    "anonymous_formula": "formula_anonymous",
-    "band_gap.search_gap.band_gap": "bandstructure.band_gap",
-    "band_gap.search_gap.is_direct": "bandstructure.is_gap_direct",
-    "chemsys": "chemsys",
-    "delta_volume": "analysis.delta_volume",
-    "density": "density",
-    "efermi": "bandstructure.efermi",
-    "elements": "elements",
-    "final_energy": "thermo.energy",
-    "final_energy_per_atom": "thermo.energy_per_atom",
-    "hubbards": "calc_settings.hubbards",
-    "initial_structure": "initial_structure",
-    "input.crystal": "initial_structure",
-    "input.potcar_spec": "calc_settings.potcar_spec",
-    "is_hubbard": "calc_settings.is_hubbard",
-    "nelements": "nelements",
-    "nsites": "nsites",
-    "pretty_formula": "formula_pretty",
-    "reduced_cell_formula": "composition_reduced",
-    "run_type": "calc_settings.run_type",
-    "spacegroup": "spacegroup",
-    "structure": "structure",
-    "total_magnetization": "magnetism.total_magnetization",
-    "unit_cell_formula": "composition",
-    "volume": "volume",
-    "warnings": "analysis.warnings",
-    "task_ids": "task_ids",
-    "task_id": "task_id",
-    "original_task_id": "task_id",
-    "input.incar": "inputs.structure_optimization.incar",
-    "input.kpoints": "inputs.structure_optimization.kpoints",
-    "encut": "inputs.structure_optimization.incar.ENCUT",
-    "formula_anonymous": "formula_anonymous"
-}
-
-SANDBOXED_PROPERTIES = {"e_above_hull": "e_above_hull", "decomposes_to": "decomposes_to"}
-
-mag_types = {"NM": "Non-magnetic", "FiM": "Ferri", "AFM": "AFM", "FM": "FM"}
-
+_settings = loadfn(MPBUILDER_SETTINGS)
 latt_para_interval = [1.50 - 1.96 * 3.14, 1.50 + 1.96 * 3.14]
 vol_interval = [4.56 - 1.96 * 7.82, 4.56 + 1.96 * 7.82]
 
 
-# minimal schema for now
-MPBUILDER_SCHEMA = {
-    "title": "mp_materials",
-    "type": "object",
-    "properties":
-        {
-            "task_id": {"type": "string"},
-            "e_above_hull": {"type": "number", "minimum": 0},
-            "structure": msonable_schema(Structure)
-        },
-    "required": ["task_id", "e_above_hull", "structure"]
-}
-
-
 class MPBuilder(Builder):
-    def __init__(self,
-                 materials,
-                 mp_materials,
-                 thermo=None,
-                 electronic_structure=None,
-                 snls=None,
-                 xrd=None,
-                 elastic=None,
-                 dielectric=None,
-                 dois=None,
-                 magnetism=None,
-                 bond_valence=None,
-                 bonds=None,
-                 propnet=None,
-                 query=None,
-                 **kwargs):
+    def __init__(
+        self,
+        materials,
+        website,
+        thermo,
+        aux=None,
+        default_sandboxes=None,
+        query=None,
+        **kwargs,
+    ):
         """
         Creates a MP Website style materials doc.
         This builder is a bit unweildy as MP will eventually move to a new format
-        Written for backwards compatability with previous infrastructure
+        written for backwards compatability with previous infrastructure
 
         Args:
             tasks (Store): Store of task documents
             materials (Store): Store of materials documents
-            mp_web (Store): Store of the mp style website docs, This will also make an electronic_structure collection and an es_plot gridfs
+                should be aggregate across multiple stores using JointStore
+            website (Store): Store of the mp style website docs
+            aux ([Store]): Auxillary data collection to join to materials doc
+                for processing
+            default_sandboxes([string]): List of default sandboxes for materials
         """
         self.materials = materials
-        self.mp_materials = mp_materials
-        self.electronic_structure = electronic_structure
-        self.snls = snls
+        self.website = website
         self.thermo = thermo
-        self.query = query if query else {}
-        self.xrd = xrd
-        self.elastic = elastic
-        self.dielectric = dielectric
-        self.dois = dois
-        self.magnetism = magnetism
-        self.bond_valence = bond_valence
-        self.bonds = bonds
-        self.propnet = propnet
+        self.aux = aux if aux else []
+        self.default_sandboxes = default_sandboxes if default_sandboxes else []
+        self.query = query
+        # self.website.validator = JSONSchemaValidator(loadfn(MPBUILDER_SCHEMA))
 
-        self.mp_materials.validator = JSONSchemaValidator(MPBUILDER_SCHEMA)
-
-        sources = list(
-            filter(None, [materials, thermo, electronic_structure, snls,
-                          elastic, dielectric, xrd, dois, magnetism,
-                          bond_valence, propnet]))
-
-        super().__init__(sources=sources, targets=[mp_materials], **kwargs)
+        super().__init__(sources=[materials, thermo] + aux, targets=[website], **kwargs)
 
     def get_items(self):
         """
-        Gets all materials that need a new MP Style materials document
-
-        Returns:
-            generator of materials to calculate xrd
+        Custom get items to allow for incremental building for a whole set of stores
         """
 
-        self.logger.info("MP Website Builder Started")
+        self.logger.info("Starting Website Builder")
 
-        self.ensure_indicies()
+        self.ensure_indexes()
 
-        # Get all new materials
-        q = dict(self.query)
-        new_mats = set(self.materials.distinct(self.materials.key)) - set(
-            self.mp_materials.distinct(self.mp_materials.key, q))
+        keys = self.get_keys()
+        self.logger.info("Processing {} items".format(len(keys)))
+        self.total = len(keys)
 
-        self.logger.info("Found {} new materials for the website".format(len(new_mats)))
+        # Chunk keys by chunk size for good data IO
+        for chunked_keys in grouper(keys, self.chunk_size, None):
+            chunked_keys = list(filter(None.__ne__, chunked_keys))
 
-        # All relevant materials that have been updated since MP Website Materials
-        # were last calculated
-        q = dict(self.query)
-        q.update(self.materials.lu_filter(self.mp_materials))
-        mats = set(self.materials.distinct(self.materials.key, q))
+            docs = {
+                d[self.materials.key]: d
+                for d in self.materials.query(
+                    criteria={self.materials.key: {"$in": chunked_keys}}
+                )
+            }
+            self.add_thermo_docs(docs)
+            self.add_aux_docs(docs)
 
-        self.logger.info("Found {} updated materials for the website".format(len(mats)))
-
-        mats = mats | new_mats
-        self.logger.info("Processing {} total materials".format(len(mats)))
-        self.total = len(mats)
-
-        for m in mats:
-
-            doc = {"material": self.materials.query_one(criteria={self.materials.key: m})}
-
-            if self.electronic_structure:
-                doc["electronic_structure"] = self.electronic_structure.query_one(criteria={
-                    self.electronic_structure.key: m,
-                    "band_gap": {
-                        "$exists": 1
-                    }
-                })
-
-            if self.elastic:
-                doc["elastic"] = self.elastic.query_one(criteria={self.elastic.key: m})
-
-            if self.dielectric:
-                doc["dielectric"] = self.dielectric.query_one(criteria={self.dielectric.key: m})
-
-            if self.thermo:
-                doc["thermo"] = self.thermo.query_one(criteria={self.thermo.key: m})
-
-            if self.snls:
-                doc["snl"] = self.snls.query_one(criteria={self.snls.key: m})
-
-            if self.xrd:
-                doc["xrd"] = self.xrd.query_one(criteria={self.xrd.key: m})
-
-            if self.dois:
-                doc["dois"] = self.dois.query_one(criteria={self.dois.key: m})
-
-            if self.magnetism:
-                doc['magnetism'] = self.magnetism.query_one(criteria={self.magnetism.key: m})
-
-            if self.bond_valence:
-                doc['bond_valence'] = self.bond_valence.query_one(criteria={self.bond_valence.key: m})
-
-            if self.bonds:
-                doc['bonds'] = self.bonds.query_one(criteria={self.bonds.key: m, "strategy": "CrystalNN"})
-
-            if self.propnet:
-                doc['propnet'] = self.propnet.query_one(
-                    criteria={self.propnet.key: m})
-
-            yield doc
+            for d in docs.values():
+                yield d
 
     def process_item(self, item):
 
-        new_style_mat = item["material"]
+        self.logger.debug("Processing: {}".format(item[self.materials.key]))
 
-        mat = old_style_mat(new_style_mat)
-        add_es(mat, new_style_mat)
+        try:
+            mat = old_style_mat(item)
 
-        if item.get("xrd", None):
-            xrd = item["xrd"]
-            add_xrd(mat, xrd)
+            # These functions convert data from old style to new style
+            add_es(mat, item)
+            add_xrd(mat, item)
+            add_elastic(mat, item)
+            add_bonds(mat, item)
+            add_propnet(mat, item)
+            add_snl(mat, item)
+            check_relaxation(mat, item)
+            add_cifs(mat)
+            add_meta(mat)
+            add_thermo(mat, item)
 
-        if item.get("dielectric", None):
-            dielectric = item["dielectric"]
-            add_dielectric(mat, dielectric)
+            processed = jsanitize(mat)
 
-        if item.get("elastic", None):
-            elastic = item["elastic"]
-            add_elastic(mat, elastic)
+        except Exception as e:
+            self.logger.error(traceback.format_exc())
+            processed = {"error": str(e)}
 
-        if item.get("thermo", None):
-            thermo = item["thermo"]
-            add_thermo(mat, thermo)
-
-        if item.get("dois", None):
-            doi = item["dois"]
-            add_dois(mat, doi)
-
-        if item.get("bond_valence", None):
-            bond_valence = item["bond_valence"]
-            add_bond_valence(mat, bond_valence)
-
-        if item.get("bonds", None):
-            bonds = item["bonds"]
-            add_bonds(mat, bonds)
-
-        if item.get("propnet", None):
-            propnet = item["propnet"]
-            add_propnet(mat, propnet)
-
-        snl = item.get("snl", {})
-        add_snl(mat, snl)
-        add_magnetism(mat, item.get("magnetism", None))
-        add_viewer_json(mat)
-        add_meta(mat)
-        sandbox_props(mat)
-        has_fields(mat)
-        return jsanitize(mat)
+        key, lu_field = self.materials.key, self.materials.lu_field
+        out = {
+            self.website.key: item[key],
+            self.website.lu_field: self.website.lu_func[1](
+                self.materials.lu_func[0](item[lu_field])
+            ),
+        }
+        out.update(processed)
+        return out
 
     def update_targets(self, items):
-        """
-        Inserts the new task_types into the task_types collection
-
-        Args:
-            items ([[dict]]): a list of list of thermo dictionaries to update
-        """
-        items = list(filter(None, items))
+        for item in items:
+            # Add in build timestamp
+            item["_bt"] = datetime.utcnow()
+            if "_id" in item:
+                del item["_id"]
 
         if len(items) > 0:
-            self.logger.info("Updating {} mp materials docs".format(len(items)))
-            self.mp_materials.update(docs=items, ordered=False)
-        else:
-            self.logger.info("No items to update")
+            self.logger.debug(f"Updating {len(items)} items")
+            self.website.update(items, update_lu=False)
 
-    def ensure_indicies(self):
+    def ensure_indexes(self):
         """
-        Ensures indexes on the tasks and materials collections
-        :return:
+        Ensures indexes on all the collections
         """
 
-        # Search index for materials
-        self.materials.ensure_index(self.materials.key, unique=True)
-        self.materials.ensure_index("task_ids")
+        self.materials.ensure_index(self.materials.key)
+        self.materials.ensure_index(self.materials.lu_field)
+
+        self.website.ensure_index(self.website.key)
+        self.website.ensure_index(self.website.lu_field)
+
+        for source in self.aux:
+            source.ensure_index(source.key)
+            source.ensure_index(source.lu_field)
+
+        # Indexes for website
+
+        self.website.ensure_index("unit_cell_formula")
+        self.website.ensure_index("reduced_cell_formula")
+        self.website.ensure_index("chemsys")
+        self.website.ensure_index("nsites")
+        self.website.ensure_index("e_above_hull")
+        self.website.ensure_index("pretty_formula")
+        self.website.ensure_index("run_type")
+        self.website.ensure_index("band_gap")
+        self.website.ensure_index("task_type")
+        self.website.ensure_index("snlgroup_id_final")
+        self.website.ensure_index("band_gap.search_gap.band_gap")
+        self.website.ensure_index("formation_energy_per_atom")
+        self.website.ensure_index("density")
+        self.website.ensure_index("volume")
+        self.website.ensure_index("spacegroup.crystal_system")
+        self.website.ensure_index("exp.tags")
+        self.website.ensure_index("anonymous_formula")
+        self.website.ensure_index("has_bandstructure")
+        self.website.ensure_index("spacegroup.symbol")
+        self.website.ensure_index("elasticity.homogeneous_poisson")
+        self.website.ensure_index("elasticity.universal_anisotropy")
+        self.website.ensure_index("elasticity.G_Voigt_Reuss_Hill")
+        self.website.ensure_index("elasticity.G_Reuss")
+        self.website.ensure_index("elasticity.G_Voigt")
+        self.website.ensure_index("elasticity.K_Reuss")
+        self.website.ensure_index("elasticity.K_Voigt_Reuss_Hill")
+        self.website.ensure_index("elasticity.K_Voigt")
+        self.website.ensure_index("nelements")
+        self.website.ensure_index("doi")
+        self.website.ensure_index("doi_bibtex")
+        self.website.ensure_index("elasticity.poisson_ratio")
+        self.website.ensure_index("nelements")
+        self.website.ensure_index("elasticity.K_VRH")
+        self.website.ensure_index("task_ids")
+        self.website.ensure_index("snl_final.about.remarks")
+        self.website.ensure_index("original_task_id")
+        self.website.ensure_index("sbxd.decomposes_to")
+        self.website.ensure_index("sbxn")
+        self.website.ensure_index("sbxd.e_above_hull")
+        self.website.ensure_index("piezo.eij_max")
+        self.website.ensure_index("exp_lattice.volume")
+        self.website.ensure_index("has")
+        self.website.ensure_index("formula_anonymous")
+        self.website.ensure_index("spacegroup.number")
+        self.website.ensure_index("last_updated")
+        self.website.ensure_index("_bt")
+
+    def get_keys(self):
+        """
+        Gets the doc keys to process
+        """
+        mat_keys = set(self.materials.distinct(self.materials.key, criteria=self.query))
+        keys = set(
+            source_keys_updated(
+                source=self.materials, target=self.website, query=self.query
+            )
+        )
+        keys |= set(source_keys_updated(source=self.thermo, target=self.website))
+
+        # Get keys for aux docs that have been updated since last processed.
+        for source in self.aux:
+            new_keys = source_keys_updated(source=source, target=self.website)
+            self.logger.info(
+                "Only considering {} new keys for {}".format(
+                    len(new_keys), source.collection_name
+                )
+            )
+            keys |= set(new_keys)
+
+        keys = (
+            keys & mat_keys
+        )  # Ensure all keys are present in main materials collection
+
+        return keys
+
+    def add_thermo_docs(self, docs):
+        # Add in thermo
+        thermo_docs = list(
+            self.thermo.query(criteria={self.materials.key: {"$in": list(docs.keys())}})
+        )
+        thermo_docs = list(sorted(thermo_docs, key=lambda x: x[self.thermo.key]))
+        self.logger.debug("Found {} thermo_docs".format(len(thermo_docs)))
+        thermo_docs = groupby(thermo_docs, key=lambda x: x[self.thermo.key])
+        for task_id, t_docs in thermo_docs:
+            docs[task_id]["thermo_docs"] = list(t_docs)
+
+    def add_aux_docs(self, docs):
+        # Get documents from all aux stores
+        chunked_keys = list(docs.keys())
+        aux_docs = []
+        for source in self.aux:
+            temp_docs = list(source.query(criteria={source.key: {"$in": chunked_keys}}))
+            self.logger.debug(
+                "Found {} docs in {} for {}".format(
+                    len(temp_docs), source.collection_name, chunked_keys
+                )
+            )
+
+            # Ensure same key field for all docs
+            if source.key != self.materials.key:
+                for d in temp_docs:
+                    d[self.materials.key] = d[source.key]
+                    del d[source.key]
+
+            # Ensure same lu_field for all docs
+            if source.lu_field != self.materials.lu_field:
+                for d in temp_docs:
+                    d[self.materials.lu_field] = d[source.lu_field]
+                    del d[source.lu_field]
+
+            # Add to our giant pile of docs
+            aux_docs.extend(temp_docs)
+
+        # Sort and group docs by materials key
+        aux_docs = list(sorted(aux_docs, key=lambda x: x[self.materials.key]))
+        aux_docs = groupby(aux_docs, key=lambda x: x[self.materials.key])
+
+        # get docs all for the same materials key
+        for task_id, sub_docs in aux_docs:
+            # sort and group docs by last_updated
+            sub_docs = list(sorted(sub_docs, key=lambda x: x[self.materials.lu_field]))
+            self.logger.debug("Merging {} docs for {}".format(len(sub_docs), task_id))
+            # merge all docs in this group together
+            d = docs[task_id]
+            d.update({k: v for doc in sub_docs for k, v in doc.items()})
+            # d = {k: v for k, v in d.items() if not k.startswith("_")}
+            # Set to most recent lu_field
+            d[self.materials.lu_field] = max(
+                doc[self.materials.lu_field] for doc in sub_docs
+            )
 
 
 #
@@ -306,10 +315,15 @@ def old_style_mat(new_style_mat):
     """
 
     mat = {}
+    mp_conversion_dict = _settings["conversion_dict"]
+    mag_types = _settings["mag_types"]
+
+    # Uses the conversion dict to copy over values which handles the bulk of the work.
     for mp, new_key in mp_conversion_dict.items():
         if has(new_style_mat, new_key):
             set_(mat, mp, get(new_style_mat, new_key))
 
+    # Anything coming through DFT is always ordered
     mat["is_ordered"] = True
     mat["is_compatible"] = True
 
@@ -319,20 +333,29 @@ def old_style_mat(new_style_mat):
     mat["unit_cell_formula"] = struc.composition.as_dict()
     mat["full_formula"] = "".join(struc.formula.split())
     vals = sorted(mat["reduced_cell_formula"].values())
-    mat["anonymous_formula"] = {string.ascii_uppercase[i]: float(vals[i]) for i in range(len(vals))}
+    mat["anonymous_formula"] = {
+        string.ascii_uppercase[i]: float(vals[i]) for i in range(len(vals))
+    }
     mat["initial_structure"] = new_style_mat.get("initial_structure", None)
     mat["nsites"] = struc.get_primitive_structure().num_sites
 
-
     set_(mat, "pseudo_potential.functional", "PBE")
 
-    set_(mat, "pseudo_potential.labels",
-         [p["titel"].split()[1] for p in get(new_style_mat, "calc_settings.potcar_spec")])
-    mat["ntask_ids"] = len(get(new_style_mat, "task_ids"))
+    set_(
+        mat,
+        "pseudo_potential.labels",
+        [
+            p["titel"].split()[1]
+            for p in get(new_style_mat, "calc_settings.potcar_spec")
+        ],
+    )
     set_(mat, "pseudo_potential.pot_type", "paw")
-    add_blessed_tasks(mat, new_style_mat)
-    add_cifs(mat)
-    check_relaxation(mat, new_style_mat)
+
+    mat["blessed_tasks"] = {
+        d["task_type"]: d["task_id"] for d in new_style_mat["origins"]
+    }
+    mat["deprecated_tasks"] = new_style_mat.get("deprecated_tasks", [])
+    mat["ntask_ids"] = len(mat["task_ids"])
 
     return mat
 
@@ -342,9 +365,22 @@ def add_es(mat, new_style_mat):
     bs_origin = None
     dos_origin = None
     try:
-        bs_origin = next((origin for origin in new_style_mat.get("origins", []) if "Line" in origin["task_type"]), None)
-        dos_origin = next((origin for origin in new_style_mat.get("origins", []) if "Uniform" in origin["task_type"]),
-                          None)
+        bs_origin = next(
+            (
+                origin
+                for origin in new_style_mat.get("origins", [])
+                if "Line" in origin["task_type"]
+            ),
+            None,
+        )
+        dos_origin = next(
+            (
+                origin
+                for origin in new_style_mat.get("origins", [])
+                if "Uniform" in origin["task_type"]
+            ),
+            None,
+        )
 
         if bs_origin:
             u_type = "GGA+U" if "+U" in bs_origin["task_type"] else "GGA"
@@ -357,44 +393,20 @@ def add_es(mat, new_style_mat):
     except Exception as e:
         print("Error in adding electronic structure: {}".format(e))
 
-    mat["has_bandstructure"] = bool(bs_origin) and bool(dos_origin)
+    mat["has_bandstructure"] = "bandstructure" in new_style_mat.get("has",[])
 
 
-def add_blessed_tasks(mat, new_style_mat):
-    blessed_tasks = {}
-    for doc in new_style_mat["origins"]:
-        blessed_tasks[doc["task_type"]] = doc["task_id"]
+def add_elastic(mat, new_style_mat):
+    if "elasticity" in new_style_mat:
+        if has(new_style_mat, "elasticity.structure.sites"):
+            mat["elasticity"]["nsites"] = len(
+                get(new_style_mat, "elasticity.structure.sites")
+            )
+        else:
+            mat["elasticity"]["nsites"] = len(get(mat, "structure.sites"))
 
-    mat["blessed_tasks"] = blessed_tasks
-
-
-def add_elastic(mat, elastic):
-    es_aliases = {
-        "G_Reuss": "g_reuss",
-        "G_VRH": "g_vrh",
-        "G_Voigt": "g_voigt",
-        "G_Voigt_Reuss_Hill": "g_vrh",
-        "K_Reuss": "k_reuss",
-        "K_VRH": "k_vrh",
-        "K_Voigt": "k_voigt",
-        "K_Voigt_Reuss_Hill": "k_vrh",
-        #        "calculations": "calculations",    <--- TODO: Add to elastic builder?
-        "elastic_anisotropy": "universal_anisotropy",
-        "elastic_tensor": "elastic_tensor",
-        "homogeneous_poisson": "homogeneous_poisson",
-        "poisson_ratio": "homogeneous_poisson",
-        "universal_anisotropy": "universal_anisotropy",
-        "elastic_tensor_original": "elastic_tensor_original",
-        "compliance_tensor": "compliance_tensor",
-        "third_order": "third_order"
-    }
-
-    mat["elasticity"] = {k: elastic["elasticity"].get(v, None)
-                         for k, v in es_aliases.items()}
-    if has(elastic, "elasticity.structure.sites"):
-        mat["elasticity"]["nsites"] = len(get(elastic, "elasticity.structure.sites"))
-    else:
-        mat["elasticity"]["nsites"] = len(get(mat, "structure.sites"))
+        if get("elasticity.warnings", None) is None:
+            mat["elasticity"]["warnings"] = []
 
 
 def add_cifs(doc):
@@ -403,101 +415,51 @@ def add_cifs(doc):
     sym_finder = SpacegroupAnalyzer(struc, symprec=symprec)
     doc["cif"] = str(CifWriter(struc))
     doc["cifs"] = {}
-    if sym_finder.get_hall():
+    try:
         primitive = sym_finder.get_primitive_standard_structure()
         conventional = sym_finder.get_conventional_standard_structure()
         refined = sym_finder.get_refined_structure()
         doc["cifs"]["primitive"] = str(CifWriter(primitive))
         doc["cifs"]["refined"] = str(CifWriter(refined, symprec=symprec))
-        doc["cifs"]["conventional_standard"] = str(CifWriter(conventional))
-        doc["cifs"]["computed"] = str(CifWriter(struc))
-        doc["spacegroup"]["symbol"] = sym_finder.get_space_group_symbol()
-        doc["spacegroup"]["number"] = sym_finder.get_space_group_number()
-        doc["spacegroup"]["point_group"] = sym_finder.get_point_group_symbol()
-        doc["spacegroup"]["crystal_system"] = sym_finder.get_crystal_system()
-        doc["spacegroup"]["hall"] = sym_finder.get_hall()
-    else:
+        doc["cifs"]["conventional_standard"] = str(
+            CifWriter(conventional, symprec=symprec)
+        )
+        doc["cifs"]["computed"] = str(CifWriter(struc, symprec=symprec))
+    except:
         doc["cifs"]["primitive"] = None
         doc["cifs"]["refined"] = None
         doc["cifs"]["conventional_standard"] = None
 
 
-def add_xrd(mat, xrd):
+def add_xrd(mat, new_style_mat):
     mat["xrd"] = {}
-    for el, doc in xrd["xrd"].items():
+    for el, doc in new_style_mat.get("xrd", {}).items():
         el_doc = {}
         el_doc["meta"] = ["amplitude", "hkl", "two_theta", "d_spacing"]
         el_doc["created_at"] = datetime.now().isoformat()
         el_doc["wavelength"] = doc["wavelength"]
 
         xrd_pattern = DiffractionPattern.from_dict(doc["pattern"])
-        el_doc["pattern"] = [[
-            float(intensity), [int(x) for x in literal_eval(list(hkls.keys())[0])], two_theta,
-            float(d_hkl)
-        ] for two_theta, intensity, hkls, d_hkl in zip(xrd_pattern.x, xrd_pattern.y, xrd_pattern.hkls,
-                                                       xrd_pattern.d_hkls)]
+        el_doc["pattern"] = [
+            [float(intensity), hkls[0]["hkl"], two_theta, float(d_hkl)]
+            for two_theta, intensity, hkls, d_hkl in zip(
+                xrd_pattern.x, xrd_pattern.y, xrd_pattern.hkls, xrd_pattern.d_hkls
+            )
+        ]
 
         mat["xrd"][el] = el_doc
 
 
-def add_thermo(mat, thermo):
-    if has(thermo, "thermo.e_above_hull"):
-        set_(mat, "e_above_hull", get(thermo, "thermo.e_above_hull"))
-
-    if has(thermo, "thermo.formation_energy_per_atom"):
-        set_(mat, "formation_energy_per_atom", get(thermo, "thermo.formation_energy_per_atom"))
-
-    if has(thermo, "thermo.decomposes_to"):
-        set_(mat, "decomposes_to", get(thermo, "thermo.decomposes_to"))
+def add_bonds(mat, new_style_mat):
+    if get("bonds.successful", new_style_mat, False):
+        mat["bonds"] = get("bonds.summary", new_style_mat)
 
 
-def sandbox_props(mat):
-    mat["sbxn"] = mat.get("sbxn", ["core", "jcesr", "vw", "shyamd", "kitchaev"])
-    mat["sbxd"] = []
-
-    for sbx in mat["sbxn"]:
-        sbx_d = {k: get(mat, v) for k, v in SANDBOXED_PROPERTIES.items() if has(mat, k)}
-        sbx_d["id"] = sbx
-        mat["sbxd"].append(sbx_d)
-
-
-def add_magnetism(mat, magnetism=None):
-
-    # for historical consistency
-    mag_types = {"NM": "Non-magnetic", "FiM": "Ferri", "AFM": "AFM", "FM": "FM"}
-
-    struc = Structure.from_dict(mat["structure"])
-    msa = CollinearMagneticStructureAnalyzer(struc)
-    mat["magnetic_type"] = mag_types[msa.ordering.value]
-
-    # this should never happen for future mats, and should have been fixed
-    # for older mats, but just in case
-    if 'magmom' not in struc.site_properties and mat['total_magnetization'] > 0.1:
-        mat["magnetic_type"] = "Magnetic (unknown ordering)"
-
-    # TODO: will deprecate the above from dedicated magnetism builder
-    if magnetism:
-        mat["magnetism"] = magnetism["magnetism"]
-
-
-def add_bond_valence(mat, bond_valence):
-    exclude_list = ['task_id', 'pymatgen_version', 'successful']
-    if bond_valence.get('successful', False):
-        for e in exclude_list:
-            if e in bond_valence:
-                del bond_valence[e]
-        mat["bond_valence"] = bond_valence
-
-
-def add_bonds(mat, bonds):
-    if bonds.get('successful', False):
-        mat["bonds"] = bonds["summary"]
-
-
-def add_snl(mat, snl=None):
+def add_snl(mat, new_style_mat):
+    snl = new_style_mat.get("snl", None)
     mat["snl"] = copy.deepcopy(mat["structure"])
     if snl:
-        mat["snl"].update(snl["snl"])
+        mat["snl"].update(snl)
     else:
         mat["snl"] = StructureNL(Structure.from_dict(mat["structure"]), []).as_dict()
         mat["snl"]["about"].update(mp_default_snl_fields)
@@ -509,22 +471,33 @@ def add_snl(mat, snl=None):
     # Extract tags from remarks by looking for just nounds and adjectives
     mat["exp"] = {"tags": []}
     for remark in mat["snl"]["about"].get("_tags", []):
-        tokens = set(tok[1] for tok in nltk.pos_tag(nltk.word_tokenize(remark), tagset='universal'))
+        tokens = set(
+            tok[1]
+            for tok in nltk.pos_tag(nltk.word_tokenize(remark), tagset="universal")
+        )
         if len(tokens.intersection({"ADV", "ADP", "VERB"})) == 0:
             mat["exp"]["tags"].append(remark)
 
 
-def add_propnet(mat, propnet):
-    exclude_list = ['compliance_tensor_voigt', 'task_id', '_id',
-                    'pretty_formula', 'inputs', 'last_updated']
-    for e in exclude_list:
-        if e in propnet:
-            del propnet[e]
-    mat["propnet"] = scrub_class_and_module(propnet)
+def add_propnet(mat, new_style_mat):
+    if "propnet" in new_style_mat:
+        propnet = new_style_mat.get("propnet", {})
+        exclude_list = [
+            "compliance_tensor_voigt",
+            "task_id",
+            "_id",
+            "pretty_formula",
+            "inputs",
+            "last_updated",
+        ]
+        for e in exclude_list:
+            if e in propnet:
+                del propnet[e]
+        mat["propnet"] = scrub_class_and_module(propnet)
 
 
 def check_relaxation(mat, new_style_mat):
-    final_structure = Structure.from_dict(mat["structure"])
+    final_structure = Structure.from_dict(new_style_mat["structure"])
 
     warnings = []
     # Check relaxation for just the initial structure to optimized structure
@@ -534,76 +507,68 @@ def check_relaxation(mat, new_style_mat):
 
     try:
         analyzer = RelaxationAnalyzer(orig_crystal, final_structure)
-        latt_para_percentage_changes = analyzer.get_percentage_lattice_parameter_changes()
+        latt_para_percentage_changes = (
+            analyzer.get_percentage_lattice_parameter_changes()
+        )
         for l in ["a", "b", "c"]:
             change = latt_para_percentage_changes[l] * 100
             if change < latt_para_interval[0] or change > latt_para_interval[1]:
-                warnings.append("Large change in a lattice parameter during relaxation.")
+                warnings.append(
+                    "Large change in a lattice parameter during relaxation."
+                )
         change = analyzer.get_percentage_volume_change() * 100
         if change < vol_interval[0] or change > vol_interval[1]:
             warnings.append("Large change in volume during relaxation.")
     except Exception as ex:
         # print icsd_crystal.formula
         # print final_structure.formula
-        print("Relaxation analyzer failed for Material:{} due to {}".format(mat["task_id"], traceback.print_exc()))
+        print(
+            "Relaxation analyzer failed for Material:{} due to {}".format(
+                mat["task_id"], traceback.print_exc()
+            )
+        )
 
     mat["warnings"] = list(set(warnings))
 
 
-def add_dielectric(mat, dielectric):
+def add_thermo(mat, new_style_mat):
+    """
+    Add's the thermo values in with sandboxing
+    """
+    if not mat["deprecated"]:
+        thermo = new_style_mat["thermo_docs"]
 
-    if "dielectric" in dielectric:
-        d = dielectric["dielectric"]
+        if "core" in mat["sbxn"]:
+            main_sbx = "core"
+        else:
+            main_sbx = mat["sbxn"][0]
 
-        mat["diel"] = {
-            "e_electronic": d["static"],
-            "e_total": d["total"],
-            "n": np.sqrt(d["e_static"]),
-            "poly_electronic": d["e_static"],
-            "poly_total": d["e_static"]
+        # Get the primary document and set in mat document
+        core_thermo = next(d for d in thermo if main_sbx in d["_sbxn"])
+
+        mat["e_above_hull"] = core_thermo["thermo"]["e_above_hull"]
+        mat["formation_energy_per_atom"] = core_thermo["thermo"][
+            "formation_energy_per_atom"
+        ]
+        if "decomposes_to" in core_thermo["thermo"]:
+            mat["decomposes_to"] = core_thermo["thermo"]["decomposes_to"]
+
+        sbxd = {}
+        sandbox_props = {
+            "e_above_hull": "thermo.e_above_hull",
+            "decomposes_to": "thermo.decomposes_to",
         }
+        for doc in thermo:
+            for sbx in doc["_sbxn"]:
+                sbx_d = {
+                    k: get(doc, v) for k, v in sandbox_props.items() if has(doc, v)
+                }
+                sbx_d["id"] = sbx
+                sbxd[sbx] = sbx_d
 
-    if "piezo" in dielectric:
-        d = dielectric["piezo"]
+        mat["sbxd"] = list(sbxd.values())
 
-        mat["piezo"] = {"eij_max": d["e_ij_max"], "piezoelectric_tensor": d["total"], "v_max": d["max_direction"]}
-
-
-def add_viewer_json(mat):
-    """
-    Generate JSON for structure viewer.
-    """
-
-    from mp_dash_components.converters.structure import StructureIntermediateFormat
-    from mp_dash_components import __version__ as mp_dash_components_version
-    structure = Structure.from_dict(mat['structure'])
-    canonical_json = StructureIntermediateFormat(structure).json
-    sga = SpacegroupAnalyzer(structure, symprec=0.1)
-    conventional_structure = sga.get_conventional_standard_structure()
-    conventional_json = StructureIntermediateFormat(conventional_structure).json
-    mat["_viewer"] = {
-        "structure_json": canonical_json,
-        "conventional_structure_json": conventional_json,
-        "_mp_dash_components_version": mp_dash_components_version
-    }
-
-
-def has_fields(mat):
-    mat["has"] = [prop for prop in ["elasticity", "piezo", "diel"] if prop in mat]
-    if "band_structure" in mat:
-        mat["has"].append("bandstructure")
-
-
-def add_dois(mat, doi):
-    if "doi" in doi:
-        mat["doi"] = doi["doi"]
-    if "bibtex" in doi:
-        mat["doi_bibtex"] = doi["bibtex"]
 
 def add_meta(mat):
-
-    meta = {
-        'emmet_version': emmet_version,
-        'pymatgen_version': pymatgen_version
-    }
-    mat['_meta'] = meta
+    meta = {"emmet_version": emmet_version, "pymatgen_version": pymatgen_version}
+    mat["_meta"] = meta

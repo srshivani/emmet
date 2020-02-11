@@ -21,6 +21,7 @@ from itertools import chain, groupby, product
 from copy import deepcopy
 
 from monty.json import jsanitize
+from monty.serialization import loadfn
 
 from pymatgen import Structure
 from pymatgen.analysis.elasticity.elastic import ElasticTensor,\
@@ -34,8 +35,8 @@ from pymatgen.analysis.structure_matcher import StructureMatcher,\
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from atomate.vasp.workflows.base.elastic import get_default_strain_states
 
-from maggma.builder import Builder
-from emmet.materials.mp_website import mag_types
+from maggma.builders import Builder
+from emmet.materials.mp_website import MPBUILDER_SETTINGS
 
 from pydash.objects import get, set_
 
@@ -46,6 +47,8 @@ __author__ = "Joseph Montoya, Shyam Dwaraknath"
 __maintainer__ = "Joseph Montoya"
 __email__ = "montoyjh@lbl.gov"
 
+
+mag_types =  loadfn(MPBUILDER_SETTINGS)["mag_types"]
 
 logger = logging.getLogger(__name__)
 
@@ -296,7 +299,7 @@ class ElasticAggregateBuilder(Builder):
                 final_doc = toec_docs[-1]
             structure = Structure.from_dict(final_doc['optimized_structure'])
             formula = structure.composition.reduced_formula
-            elements = [s.symbol for s in structure.composition.elements]
+            elements = sorted(set([e.symbol for e in structure.composition.elements]))
             chemsys = '-'.join(elements)
 
             # Issue warning if relaxed structure differs

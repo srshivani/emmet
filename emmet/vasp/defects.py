@@ -21,6 +21,7 @@ from pymatgen.electronic_structure.bandstructure import BandStructure
 from pymatgen.analysis.defects.core import Vacancy, Substitution, Interstitial, DefectEntry
 from pymatgen.analysis.defects.thermodynamics import DefectPhaseDiagram
 from pymatgen.analysis.defects.defect_compatibility import DefectCompatibility
+from pprint import pprint
 
 from maggma.builder import Builder
 
@@ -111,7 +112,7 @@ class DefectBuilder(Builder):
         # bulk_supercell, dielectric calc, BS calc, HSE-BS calc
         bulksc = {"state": "successful", 'transformations.history.0.@module':
             {'$in': ['pymatgen.transformations.standard_transformations']}}
-        dielq = {"state": "successful", "input.incar.LEPSILON": True, "input.incar.LPEAD": True}
+        dielq = {"state": "successful", "task_label": "static dielectric", "input.incar.LEPSILON": True, "input.incar.LPEAD": True}
         HSE_BSq = {"state": "successful", 'calcs_reversed.0.input.incar.LHFCALC': True,
                    'transformations.history.0.@module':
                         {'$nin': ['pymatgen.transformations.defect_transformations',
@@ -139,10 +140,12 @@ class DefectBuilder(Builder):
                 #grab all bulk calcs for chemsys
                 q = bulksc.copy()
                 q.update( {"chemsys": chemsys})
+                q.update(dict(self.query))
                 bulk_tasks = list(self.tasks.query(criteria=q, properties=needed_bulk_properties))
 
                 #grab all diel calcs for chemsys
                 q = dielq.copy()
+                q.update(dict(self.query))
                 q.update( {"chemsys": chemsys})
                 diel_tasks = list(self.tasks.query(criteria=q,
                                                    properties=['task_id', 'task_label', 'last_updated',
@@ -150,6 +153,7 @@ class DefectBuilder(Builder):
 
                 #grab all hse bs calcs for chemsys
                 q = HSE_BSq.copy()
+                q.update(dict(self.query))
                 q.update( {"chemsys": chemsys})
                 hybrid_tasks = list(self.tasks.query(criteria=q,
                                                      properties=['task_id', 'input',
@@ -215,7 +219,10 @@ class DefectBuilder(Builder):
         defect_energy = defect_task['output']['energy']
         parameters.update({'defect_energy': defect_energy})
 
-        defect, parameters = self.load_defect_and_structure_data( defect_task, parameters)
+        defect, parameters = self.load_defect_and_structure_data(defect_task, parameters)
+        if not parameters['initial_final_struct_match']:
+            self.logger.error("Initial and final structs did not match. Skipping.")
+            return
 
         parameters = self.load_defect_chg_correction_metadata( defect, defect_task, parameters)
 
@@ -239,7 +246,7 @@ class DefectBuilder(Builder):
                                     corrections = {}, parameters = parameters, entry_id= defect_task['task_id'])
 
         defect_entry = self.compatibility.process_entry( defect_entry)
-        defect_entry.parameters = jsanitize( defect_entry.parameters, strict=True, allow_bson=True)
+        defect_entry.parameters = jsanitize(defect_entry.parameters, strict=True, allow_bson=True)
         defect_entry_as_dict = defect_entry.as_dict()
         defect_entry_as_dict['task_id'] = defect_entry_as_dict['entry_id'] #this seemed neccessary for legacy db
 
@@ -373,16 +380,16 @@ class DefectBuilder(Builder):
                 d_potcar['pot_spec'] = set([d for d in d_potcar['pot_spec'] if d in diel_potcar['pot_spec']])
                 d_potcar['pot_labels'] = set([d for d in d_potcar['pot_labels'] if d in diel_potcar['pot_labels']])
 
-                if diel_potcar == d_potcar:
-                    diel_matched.append( diel_task.copy())
-                else:
-                    try:
-                        self.logger.debug("Dielectric structure match was found for {} with {}, "
-                                          "but:".format( diel_task['task_label'], out_defect_task['task_label']))
-                    except:
-                        self.logger.debug("Dielectric STRUCT MATCH was found, but task_label did not exist AND:")
-                    out_pot = {k:[v, diel_potcar[k]] for k,v in d_potcar.items() if v != diel_potcar[k]}
-                    self.logger.debug("\tPotcar specs were different: {} ".format( out_pot))
+                # if diel_potcar == d_potcar:
+                diel_matched.append( diel_task.copy())
+                # else:
+                #     try:
+                #         self.logger.debug("Dielectric structure match was found for {} with {}, "
+                #                           "but:".format( diel_task['task_label'], out_defect_task['task_label']))
+                #     except:
+                #         self.logger.debug("Dielectric STRUCT MATCH was found, but task_label did not exist AND:")
+                #     out_pot = {k:[v, diel_potcar[k]] for k,v in d_potcar.items() if v != diel_potcar[k]}
+                #     self.logger.debug("\tPotcar specs were different: {} ".format( out_pot))
             # else:
             #     self.logger.debug("{} ({}) had a structure which did not match {} for use "
             #                       "as a dielectric calculation".format( diel_task['task_label'],
@@ -416,7 +423,7 @@ class DefectBuilder(Builder):
             for hse_bs_task in additional_tasks['hsebs']:
                 hse_bs_struct = Structure.from_dict(hse_bs_task['input']['structure'])
                 if diel_sm.fit(hse_bs_struct, dstruct_withoutdefect): #can use same matching scheme as the dielectric structure matcher
-                    hse_bs_matched.append( hse_bs_task.copy())
+                    hse_bs_matched.append(hse_bs_task.copy())
                 else:
                     self.logger.debug("task id {} has a structure which did not match {} for use "
                                       "as an HSE BS calculation".format( hse_bs_task['task_id'],
@@ -428,11 +435,11 @@ class DefectBuilder(Builder):
                 hybrid_meta = {'hybrid_cbm': hybrid_cbm_data[0], 'hybrid_CBM_task_id': hybrid_cbm_data[1],
                                'hybrid_vbm': hybrid_vbm_data[0], 'hybrid_VBM_task_id': hybrid_vbm_data[1]}
                 out_defect_task["hybrid_bs_meta"] = hybrid_meta.copy()
-                self.logger.debug("Found hybrid band structure properties for {}:\n\t{}".format( out_defect_task['task_label'],
+                self.logger.debug("Found hybrid band structure properties for {}:\n\t{}".format(out_defect_task['task_label'],
                                                                                                hybrid_meta))
             else:
                 self.logger.debug("Could NOT find hybrid band structure properties for {} despite "
-                                  "there being {} eligible hse calculations".format( out_defect_task['task_label'],
+                                  "there being {} eligible hse calculations".format(out_defect_task['task_label'],
                                                                                      len(additional_tasks['hsebs'])))
 
         return out_defect_task
@@ -500,58 +507,57 @@ class DefectBuilder(Builder):
         return parameters
 
     def get_bulk_gap_data(self, bulk_task, parameters):
-        bulk_structure = parameters['bulk_sc_structure']
-        try:
-            with MPRester() as mp:
-                # mplist = mp.find_structure(bulk_structure) #had to hack this because this wasnt working??
-                tmp_mplist = mp.get_entries_in_chemsys(list(bulk_structure.symbol_set))
-            mplist = [ment.entry_id for ment in tmp_mplist if ment.composition.reduced_composition == \
-                      bulk_structure.composition.reduced_composition]
-            #TODO: this is a hack because find_structure was data intensive. simplify the hack to do less queries...
-        except:
-            raise ValueError("Error with querying MPRester for {}".format( bulk_structure.composition.reduced_formula))
+        #bulk_structure = parameters['bulk_sc_structure']
+        # try:
+        #     with MPRester() as mp:
+        #         # mplist = mp.find_structure(bulk_structure) #had to hack this because this wasnt working??
+        #         tmp_mplist = mp.get_entries_in_chemsys(list(bulk_structure.symbol_set))
+        #     mplist = [ment.entry_id for ment in tmp_mplist if ment.composition.reduced_composition == \
+        #               bulk_structure.composition.reduced_composition]
+        #     #TODO: this is a hack because find_structure was data intensive. simplify the hack to do less queries...
+        # except:
+        #     raise ValueError("Error with querying MPRester for {}".format( bulk_structure.composition.reduced_formula))
+        #
+        # mpid_fit_list = []
+        # for trial_mpid in mplist:
+        #     with MPRester() as mp:
+        #         mpstruct = mp.get_structure_by_material_id(trial_mpid)
+        #     if StructureMatcher(ltol=self.ltol, stol=self.stol, angle_tol=self.angle_tol,
+        #                         primitive_cell=True, scale=False, attempt_supercell=True,
+        #                         allow_subset=False).fit(bulk_structure, mpstruct):
+        #         mpid_fit_list.append( trial_mpid)
+        #
+        # if len(mpid_fit_list) == 1:
+        #     mpid = mpid_fit_list[0]
+        #     self.logger.debug("Single mp-id found for bulk structure:{}.".format( mpid))
+        # elif len(mpid_fit_list) > 1:
+        #     num_mpid_list = [int(mp.split('-')[1]) for mp in mpid_fit_list]
+        #     num_mpid_list.sort()
+        #     mpid  = 'mp-'+str(num_mpid_list[0])
+        #     self.logger.debug("Multiple mp-ids found for bulk structure:{}\nWill use lowest number mpid "
+        #           "for bulk band structure = {}.".format(str(mpid_fit_list), mpid))
+        # else:
+        #     self.logger.debug("Could not find bulk structure in MP database after tying the "
+        #                       "following list:\n{}".format( mplist))
+        #     mpid = None
+        #
+        # if mpid and not parameters['task_level_metadata']['incar_calctype_summary']['LHFCALC']:
+        #     #TODO: NEED to be smarter about use of +U etc in MP gga band structure calculations...
+        #     with MPRester() as mp:
+        #         bs = mp.get_bandstructure_by_material_id(mpid)
+        #
+        #     parameters['task_level_metadata'].update( {'MP_gga_BScalc_data':
+        #                                                    bs.get_band_gap().copy()} ) #contains gap kpt transition
+        #     cbm = bs.get_cbm()['energy']
+        #     vbm = bs.get_vbm()['energy']
+        #     gap = bs.get_band_gap()['energy']
+        # else:
+        parameters['task_level_metadata'].update( {'MP_gga_BScalc_data': None}) #to signal no MP BS is used
+        cbm = bulk_task['output']['cbm']
+        vbm = bulk_task['output']['vbm']
+        gap = bulk_task['output']['bandgap']
 
-        mpid_fit_list = []
-        for trial_mpid in mplist:
-            with MPRester() as mp:
-                mpstruct = mp.get_structure_by_material_id(trial_mpid)
-            if StructureMatcher(ltol=self.ltol, stol=self.stol, angle_tol=self.angle_tol,
-                                primitive_cell=True, scale=False, attempt_supercell=True,
-                                allow_subset=False).fit(bulk_structure, mpstruct):
-                mpid_fit_list.append( trial_mpid)
-
-        if len(mpid_fit_list) == 1:
-            mpid = mpid_fit_list[0]
-            self.logger.debug("Single mp-id found for bulk structure:{}.".format( mpid))
-        elif len(mpid_fit_list) > 1:
-            num_mpid_list = [int(mp.split('-')[1]) for mp in mpid_fit_list]
-            num_mpid_list.sort()
-            mpid  = 'mp-'+str(num_mpid_list[0])
-            self.logger.debug("Multiple mp-ids found for bulk structure:{}\nWill use lowest number mpid "
-                  "for bulk band structure = {}.".format(str(mpid_fit_list), mpid))
-        else:
-            self.logger.debug("Could not find bulk structure in MP database after tying the "
-                              "following list:\n{}".format( mplist))
-            mpid = None
-
-        if mpid and not parameters['task_level_metadata']['incar_calctype_summary']['LHFCALC']:
-            #TODO: NEED to be smarter about use of +U etc in MP gga band structure calculations...
-            with MPRester() as mp:
-                bs = mp.get_bandstructure_by_material_id(mpid)
-
-            parameters['task_level_metadata'].update( {'MP_gga_BScalc_data':
-                                                           bs.get_band_gap().copy()} ) #contains gap kpt transition
-            cbm = bs.get_cbm()['energy']
-            vbm = bs.get_vbm()['energy']
-            gap = bs.get_band_gap()['energy']
-        else:
-            parameters['task_level_metadata'].update( {'MP_gga_BScalc_data': None}) #to signal no MP BS is used
-            cbm = bulk_task['output']['cbm']
-            vbm = bulk_task['output']['vbm']
-            gap = bulk_task['output']['bandgap']
-
-        parameters.update( {'mpid': mpid,
-                            "cbm": cbm, "vbm": vbm, "gap": gap} )
+        parameters.update({"cbm": cbm, "vbm": vbm, "gap": gap})
 
         return parameters
 
@@ -589,13 +595,16 @@ class DefectBuilder(Builder):
         ids_sm = StructureMatcher( ltol=self.ltol, stol=self.stol, angle_tol=self.angle_tol,
                                    primitive_cell=False, scale=False, attempt_supercell=False,
                                    allow_subset=False)
-        if not ids_sm.fit( ids, initial_defect_structure):
+        initial_final_struct_match = True
+        if not ids_sm.fit(ids, initial_defect_structure):
             self.logger.error("Could not match initial-to-final structure. Will not load initial structure.")
-            initial_defect_structure = None
+            initial_final_struct_match = False
+            # initial_defect_structure = None
 
         parameters.update({'final_defect_structure': final_defect_structure,
                            'initial_defect_structure': initial_defect_structure,
-                           'scaling_matrix': scaling_matrix})
+                           'scaling_matrix': scaling_matrix,
+                           'initial_final_struct_match': initial_final_struct_match})
 
         return defect, parameters
 
@@ -608,6 +617,7 @@ class DefectBuilder(Builder):
             axes.sort()
             defect_planar_averages = [deflpt[ax] for ax in axes]
             abc = parameters['initial_defect_structure'].lattice.abc
+
             axis_grid = []
             for ax in range(3):
                 num_pts = len(defect_planar_averages[ax])
@@ -738,7 +748,7 @@ class DefectThermoBuilder(Builder):
 
         #get all new Defect Entries since last time DefectThermo was updated...
         q = dict(self.query)
-        self.logger.debug('query is initially: {}'.format( q))
+        self.logger.debug('query is initially: {}'.format(q))
         if not self.update_all:
             # if not update_all then grab entry_ids of defects that have been analyzed already...
             prev_dpd = list(self.defectthermo.query(properties=['metadata.all_entry_ids_considered']))
@@ -757,7 +767,7 @@ class DefectThermoBuilder(Builder):
 
         # restricted amount of defect info for PD, so not an overwhelming database query
         entry_keys_needed_for_thermo = ['defect', 'parameters.task_level_metadata', 'parameters.last_updated',
-                                        'task_id', 'entry_id', '@module', '@class',
+                                        'task_id', 'entry_id', '@module', '@class', 'parameters.',
                                         'uncorrected_energy', 'corrections', 'parameters.dielectric',
                                         'parameters.cbm', 'parameters.vbm', 'parameters.gap',
                                         'parameters.hybrid_cbm', 'parameters.hybrid_vbm',
@@ -765,6 +775,7 @@ class DefectThermoBuilder(Builder):
                                         'parameters.freysoldt_meta',
                                         'parameters.kumagai_meta', 'parameters.is_compatible',
                                         'parameters.delocalization_meta', 'parameters.phasediagram_meta']
+
         defect_entries = list(self.defects.query(criteria=q,
                                                         properties=entry_keys_needed_for_thermo))
         thermo_entries = list(self.defectthermo.query(properties=['bulk_chemsys', 'bulk_prim_struct',
@@ -805,8 +816,8 @@ class DefectThermoBuilder(Builder):
             matched = False
             for grp_ind, grpd_entry in enumerate(grpd_entry_list):
                 if grpd_entry[0] == bulk_chemsys and grpd_entry[1] == run_metadata:
-                    if sm.fit( base_bulk_struct, grpd_entry[2]):
-                        grpd_entry[3].append( entry_dict.copy())
+                    if sm.fit(base_bulk_struct, grpd_entry[2]):
+                        grpd_entry[3].append(entry_dict.copy())
                         matched = True
                         break
                     else:
@@ -827,8 +838,8 @@ class DefectThermoBuilder(Builder):
                             else:
                                 old_entries_list = []
 
-                            old_entries_list.append( entry_dict.copy())
-                            grpd_entry_list.append( [bulk_chemsys, run_metadata.copy(),  base_bulk_struct.copy(),
+                            old_entries_list.append(entry_dict.copy())
+                            grpd_entry_list.append([bulk_chemsys, run_metadata.copy(),  base_bulk_struct.copy(),
                                                      old_entries_list, t_ent['entry_id']])
                             matched = True
                             break
@@ -840,7 +851,7 @@ class DefectThermoBuilder(Builder):
             if not matched:
                 # create new thermo phase diagram for this system,
                 # entry_id will be generated later on
-                grpd_entry_list.append( [bulk_chemsys, run_metadata.copy(), base_bulk_struct.copy(),
+                grpd_entry_list.append([bulk_chemsys, run_metadata.copy(), base_bulk_struct.copy(),
                                          [entry_dict.copy()], 'None'])
 
 
@@ -853,6 +864,7 @@ class DefectThermoBuilder(Builder):
         distinct_entries_full = [] #for storing full defect_dict
         distinct_entries = {} #for storing defect object
         bulk_chemsys, run_metadata, bulk_prim_struct, entrylist, entry_id = items
+
         self.logger.debug("Processing bulk_chemsys {}".format(bulk_chemsys))
 
         needed_entry_keys = ['@module', '@class', 'defect', 'uncorrected_energy', 'corrections',

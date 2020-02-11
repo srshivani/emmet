@@ -131,7 +131,8 @@
       "GGA Static": 1,
       "GGA Structure Optimization": 2,
       "GGA+U Static": 5,
-      "GGA+U Structure Optimization": 6
+      "GGA+U Structure Optimization": 6,
+      "SCAN Structure Optimization": 7
     },
     "tasks_key": "output.energy",
     "track": true
@@ -142,7 +143,8 @@
       "GGA Static": 1,
       "GGA Structure Optimization": 2,
       "GGA+U Static": 5,
-      "GGA+U Structure Optimization": 6
+      "GGA+U Structure Optimization": 6,
+      "SCAN Structure Optimization": 7
     },
     "tasks_key": "output.energy_per_atom",
     "track": true
@@ -160,7 +162,8 @@
     "materials_key": "calc_settings.hubbards",
     "quality_score": {
       "GGA Structure Optimization": 1,
-      "GGA+U Structure Optimization": 5
+      "GGA+U Structure Optimization": 5,
+      "SCAN Structure Optimization": 7
     },
     "tasks_key": "input.hubbards"
   },
@@ -168,7 +171,8 @@
     "materials_key": "calc_settings.potcar_spec",
     "quality_score": {
       "GGA Structure Optimization": 1,
-      "GGA+U Structure Optimization": 5
+      "GGA+U Structure Optimization": 5,
+      "SCAN Structure Optimization": 7
     },
     "tasks_key": "input.potcar_spec"
   },
@@ -176,7 +180,8 @@
     "materials_key": "calc_settings.run_type",
     "quality_score": {
       "GGA Structure Optimization": 1,
-      "GGA+U Structure Optimization": 5
+      "GGA+U Structure Optimization": 5,
+      "SCAN Structure Optimization": 7
     },
     "tasks_key": "calcs_reversed.0.run_type"
   },
@@ -184,7 +189,8 @@
     "materials_key": "calc_settings.is_hubbard",
     "quality_score": {
       "GGA Structure Optimization": 1,
-      "GGA+U Structure Optimization": 5
+      "GGA+U Structure Optimization": 5,
+      "SCAN Structure Optimization": 7
     },
     "tasks_key": "input.is_hubbard"
   },
@@ -223,13 +229,34 @@
   {
     "materials_key": "inputs.hse_band_gap",
     "quality_score": {
-      "HSE Static": 2,
-      "HSE Structure Optimization": 1
+      "HSE Static": 2
     },
     "tasks_key": "orig_inputs"
   },
   {
-    "materials_key": "spacegroup",
+    "materials_key": "inputs.dielectric",
+    "quality_score": {
+      "GGA Static Dielectric": 2,
+      "GGA+U Static Dielectric": 6
+    },
+    "tasks_key": "orig_inputs"
+  },
+  {
+    "materials_key": "inputs.scan_opt",
+    "quality_score": {
+      "SCAN Structure Optimization": 2
+    },
+    "tasks_key": "orig_inputs"
+  },
+  {
+    "materials_key": "inputs.scan_static",
+    "quality_score": {
+      "SCAN Static": 6
+    },
+    "tasks_key": "orig_inputs"
+  },
+  {
+    "materials_key": "symmetry",
     "quality_score": {
       "GGA Structure Optimization": 1,
       "GGA+U Structure Optimization": 5
@@ -239,16 +266,11 @@
   {
     "materials_key": "structure",
     "quality_score": {
-      "GGA NSCF Line": 4,
-      "GGA NSCF Uniform": 4,
-      "GGA Static": 5,
       "GGA Structure Optimization": 7,
-      "GGA+U NSCF Line": 4,
-      "GGA+U NSCF Uniform": 4,
-      "GGA+U Static": 6,
       "GGA+U Structure Optimization": 8
     },
-    "tasks_key": "output.structure"
+    "tasks_key": "output.structure",
+    "track": true
   },
   {
     "aggregate": true,
@@ -276,6 +298,25 @@
       "GGA+U Structure Optimization": 5
     },
     "tasks_key": "calcs_reversed.0.output.outcar.total_magnetization"
+  },
+  {
+    "materials_key": "magnetism.magmoms",
+    "quality_score": {
+      "GGA Static": 2,
+      "GGA Structure Optimization": 1,
+      "GGA+U Static": 6,
+      "GGA+U Structure Optimization": 5
+    },
+    "tasks_key": "calcs_reversed.0.output.outcar.magmom",
+    "optional": true
+  },
+  {
+    "materials_key": "dielectric.structure",
+    "quality_score": {
+      "GGA Static Dielectric": 2,
+      "GGA+U Static Dielectric": 6
+    },
+    "tasks_key": "output.structure"
   },
   {
     "materials_key": "dielectric.static",
@@ -316,5 +357,21 @@
       "GGA+U Static Dielectric": 6
     },
     "tasks_key": "calcs_reversed.0.output.outcar.born"
+  },
+  {
+    "materials_key": "force_constants",
+    "quality_score": {
+      "GGA Static Dielectric": 2,
+      "GGA+U Static Dielectric": 6
+    },
+    "tasks_key": "calcs_reversed.0.output.force_constants"
+  },
+  {
+    "materials_key": "internal_strain_tensor",
+    "quality_score": {
+      "GGA Static Dielectric": 2,
+      "GGA+U Static Dielectric": 6
+    },
+    "tasks_key": "calcs_reversed.0.output.outcar.internal_strain_tensor"
   }
 ]

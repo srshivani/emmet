@@ -1,95 +1,87 @@
+import os.path
+from monty.serialization import loadfn
+
 from pymatgen.core.structure import Structure
 from pymatgen.analysis.bond_valence import BVAnalyzer
 from pymatgen.core.periodic_table import Specie
 from pymatgen import __version__ as pymatgen_version
 
-from maggma.builder import Builder
+from maggma.builders import MapBuilder
 from maggma.validator import JSONSchemaValidator
 
-
-BOND_VALENCE_SCHEMA = {
-    "title": "bond_valence",
-    "type": "object",
-    "properties":
-        {
-            "task_id": {"type": "string"},
-            "method": {"type": "string"},
-            "possible_species": {"type": "array", "items": {"type": "strinig"}},
-            "possible_valences": {"type": "array", "items": {"type": "number"}},
-            "successful": {"type": "boolean"},
-            "pymatgen_version": {"type": "string"},
-        },
-    "required": ["task_id", "successful", "pymatgen_version"]
-}
+MODULE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+BOND_VALENCE_SCHEMA = os.path.join(MODULE_DIR, "schema", "bond_valence.json")
 
 
-class BondValenceBuilder(Builder):
+class BondValenceBuilder(MapBuilder):
     """
     Calculate plausible oxidation states from structures.
     """
 
-    def __init__(self, materials, bond_valence,
-                 query=None, **kwargs):
+    def __init__(self, materials, bond_valence, **kwargs):
 
         self.materials = materials
         self.bond_valence = bond_valence
-        self.query = query or {}
+        self.bond_valence.validator = JSONSchemaValidator(loadfn(BOND_VALENCE_SCHEMA))
+        super().__init__(
+            source=materials,
+            target=bond_valence,
+            ufn=self.calc,
+            projection=["structure"],
+            timeout=14,
+            **kwargs
+        )
 
-        super().__init__(sources=[materials],
-                         targets=[bond_valence],
-                         **kwargs)
+    def calc(self, item):
+        s = Structure.from_dict(item["structure"])
 
-    def get_items(self):
+        d = {
+            "pymatgen_version": pymatgen_version,
+            "successful": False,
+            "bond_valence": {"structure": item["structure"], "method": None},
+        }
 
-        materials = self.materials.query(criteria=self.query,
-                                         properties=["task_id", "structure"])
-        # All relevant materials that have been updated since bond valences
-        # were last calculated
-        q = dict(self.query)
-        q.update(self.materials.lu_filter(self.bond_valence))
-        new_keys = list(self.materials.distinct(self.materials.key, q))
-
-        materials = self.materials.query(criteria={self.materials.key: {'$in': new_keys}},
-                                         properties=["task_id", "structure"])
-
-        self.total = materials.count()
-        self.logger.info("Found {} new materials for bond valence analysis".format(self.total))
-
-        for material in materials:
-            yield material
-
-    def process_item(self, item):
-        s = Structure.from_dict(item['structure'])
         try:
             bva = BVAnalyzer()
             valences = bva.get_valences(s)
-            possible_species = {str(Specie(s[idx].specie, oxidation_state=valence))
-                                for idx, valence in enumerate(valences)}
+            possible_species = {
+                str(Specie(s[idx].specie, oxidation_state=valence))
+                for idx, valence in enumerate(valences)
+            }
 
-            method = "BVAnalyzer"
-        except ValueError:
+            d["successful"] = True
+            s.add_oxidation_state_by_site(valences)
+
+            d["bond_valence"] = {
+                "possible_species": list(possible_species),
+                "possible_valences": valences,
+                "method": "BVAnalyzer",
+                "structure": s.as_dict(),
+            }
+
+        except Exception as e:
+            self.logger.error("BVAnalyzer failed with: {}".format(e))
+
             try:
-                first_oxi_state_guess = s.composition.oxi_state_guesses()[0]
+                first_oxi_state_guess = s.composition.oxi_state_guesses(max_sites=-50)[
+                    0
+                ]
                 valences = [first_oxi_state_guess[site.species_string] for site in s]
-                possible_species = {str(Specie(el, oxidation_state=valence))
-                                    for el, valence in first_oxi_state_guess.items()}
-                method = "oxi_state_guesses"
-            except:
-                return {
-                    "task_id": item['task_id'],
-                    "pymatgen_version": pymatgen_version,
-                    "successful": False
+                possible_species = {
+                    str(Specie(el, oxidation_state=valence))
+                    for el, valence in first_oxi_state_guess.items()
                 }
 
-        return {
-            "task_id": item['task_id'],
-            "possible_species": list(possible_species),
-            "possible_valences": valences,
-            "method": method,
-            "pymatgen_version": pymatgen_version,
-            "successful": True
-        }
+                d["successful"] = True
+                s.add_oxidation_state_by_site(valences)
 
-    def update_targets(self, items):
-        self.logger.debug("Updating {} bond valence documents".format(len(items)))
-        self.bond_valence.update(docs=items, key=['task_id'])
+                d["bond_valence"] = {
+                    "possible_species": list(possible_species),
+                    "possible_valences": valences,
+                    "method": "oxi_state_guesses",
+                    "structure": s.as_dict(),
+                }
+            except Exception as e:
+                self.logger.error("Oxidation state guess failed with: {}".format(e))
+
+        return d

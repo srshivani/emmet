@@ -6,13 +6,13 @@ from pymatgen.core.tensors import Tensor
 from pymatgen.analysis.piezo import PiezoTensor
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
-from maggma.builder import Builder
+from maggma.builders import MapBuilder
 
 __author__ = "Shyam Dwaraknath <shyamd@lbl.gov>"
 
 
-class DielectricBuilder(Builder):
-    def __init__(self, materials, dielectric, query=None, **kwargs):
+class DielectricBuilder(MapBuilder):
+    def __init__(self, materials, dielectric, max_miller=10, query=None, **kwargs):
         """
         Creates a dielectric collection for materials
 
@@ -20,39 +20,26 @@ class DielectricBuilder(Builder):
             materials (Store): Store of materials documents to match to
             dielectric (Store): Store of dielectric properties
             min_band_gap (float): minimum band gap for a material to look for a dielectric calculation to build
+            max_miller (int): Max miller index when searching for max direction for piezo response
             query (dict): dictionary to limit materials to be analyzed
         """
 
         self.materials = materials
         self.dielectric = dielectric
-
+        self.max_miller = max_miller
         self.query = query if query else {}
+        self.query.update({"dielectric": {"$exists": 1}})
 
-        super().__init__(sources=[materials], targets=[dielectric], **kwargs)
+        super().__init__(
+            source=materials,
+            target=dielectric,
+            query=self.query,
+            ufn=self.calc,
+            projection=["dielectric", "piezo", "structure", "bandstructure.band_gap"],
+            **kwargs
+        )
 
-    def get_items(self):
-        """
-        Gets all items to process into materials documents
-
-        Returns:
-            generator or list relevant tasks and materials to process into materials documents
-        """
-
-        self.logger.info("Dielectric Builder Started")
-
-        self.logger.info("Setting indexes")
-        self.ensure_indicies()
-
-        q = dict(self.query)
-        q.update(self.materials.lu_filter(self.dielectric))
-        q["dielectric"] = {"$exists": 1}
-        mats = self.materials.distinct(self.materials.key, q)
-
-        self.logger.info("Found {} new materials for dielectric data".format(len(mats)))
-
-        return self.materials.query(criteria=q, properties=[self.materials.key, "dielectric", "piezo", "structure"])
-
-    def process_item(self, item):
+    def calc(self, item):
         """
         Process the tasks and materials into a dielectrics collection
 
@@ -65,78 +52,81 @@ class DielectricBuilder(Builder):
 
         def poly(matrix):
             diags = np.diagonal(matrix)
-            return np.prod(diags) / np.sum(np.prod(comb) for comb in combinations(diags, 2))
+            return np.prod(diags) / np.sum(
+                np.prod(comb) for comb in combinations(diags, 2)
+            )
 
-        d = {self.dielectric.key: item[self.materials.key]}
+        if item["bandstructure"]["band_gap"] > 0:
 
-        structure = Structure.from_dict(item["structure"])
+            structure = Structure.from_dict(
+                item.get("dielectric", {}).get("structure", None)
+            )
 
-        if item.get("dielectric", False):
-            ionic = Tensor(item["dielectric"]["ionic"]).symmetrized.fit_to_structure(structure).convert_to_ieee(structure)
-            static = Tensor(item["dielectric"]["static"]).symmetrized.fit_to_structure(structure).convert_to_ieee(structure)
+            ionic = Tensor(item["dielectric"]["ionic"]).convert_to_ieee(structure)
+            static = Tensor(item["dielectric"]["static"]).convert_to_ieee(structure)
             total = ionic + static
 
-            d["dielectric"] = {
-                "total": total,
-                "ionic": ionic,
-                "static": static,
-                "e_total": poly(total),
-                "e_ionic": poly(ionic),
-                "e_static": poly(static)
+            d = {
+                "dielectric": {
+                    "total": total,
+                    "ionic": ionic,
+                    "static": static,
+                    "e_total": np.average(np.diagonal(total)),
+                    "e_ionic": np.average(np.diagonal(ionic)),
+                    "e_static": np.average(np.diagonal(static)),
+                    "n": np.sqrt(np.average(np.diagonal(static))),
+                }
             }
 
-        sga = SpacegroupAnalyzer(structure)
-        # Update piezo if non_centrosymmetric
-        if item.get("piezo", False) and not sga.is_laue():
-            static = PiezoTensor.from_voigt(np.array(
-                item['piezo']["static"])).symmetrized.fit_to_structure(structure).convert_to_ieee(structure).voigt
-            ionic = PiezoTensor.from_voigt(np.array(
-                item['piezo']["ionic"])).symmetrized.fit_to_structure(structure).convert_to_ieee(structure).voigt
-            total = ionic + static
+            sga = SpacegroupAnalyzer(structure)
+            # Update piezo if non_centrosymmetric
+            if item.get("piezo", False) and not sga.is_laue():
+                static = PiezoTensor.from_voigt(np.array(item["piezo"]["static"]))
+                ionic = PiezoTensor.from_voigt(np.array(item["piezo"]["ionic"]))
+                total = ionic + static
 
-            directions, charges, strains = np.linalg.svd(total)
+                # Symmeterize Convert to IEEE orientation
+                total = total.convert_to_ieee(structure)
+                ionic = ionic.convert_to_ieee(structure)
+                static = static.convert_to_ieee(structure)
 
-            max_index = np.argmax(np.abs(charges))
-            d["piezo"] = {
-                "total": total,
-                "ionic": ionic,
-                "static": static,
-                "e_ij_max": charges[max_index],
-                "max_direction": directions[max_index],
-                "strain_for_max": strains[max_index]
-            }
+                directions, charges, strains = np.linalg.svd(
+                    total.voigt, full_matrices=False
+                )
 
-        if len(d) > 1:
-            return d
+                max_index = np.argmax(np.abs(charges))
 
-        return None
+                max_direction = directions[max_index]
 
-    def update_targets(self, items):
-        """
-        Inserts the new task_types into the task_types collection
+                # Allow a max miller index of 10
+                min_val = np.abs(max_direction)
+                min_val = min_val[min_val > (np.max(min_val) / self.max_miller)]
+                min_val = np.min(min_val)
 
-        Args:
-            items ([([dict],[int])]): A list of tuples of materials to update and the corresponding processed task_ids
-        """
-
-        items = list(filter(None, items))
-
-        if len(items) > 0:
-            self.logger.info("Updating {} dielectrics".format(len(items)))
-            self.dielectric.update(items)
+                d["piezo"] = {
+                    "total": total.zeroed().voigt,
+                    "ionic": ionic.zeroed().voigt,
+                    "static": static.zeroed().voigt,
+                    "e_ij_max": charges[max_index],
+                    "max_direction": np.round(max_direction / min_val),
+                    "strain_for_max": strains[max_index],
+                }
         else:
-            self.logger.info("No items to update")
+            d = {
+                "dielectric": {},
+                "_warngings": [
+                    "Dielectric calculated for likely metal. Values are unlikely to be converged"
+                ],
+            }
 
-    def ensure_indicies(self):
-        """
-        Ensures indexes on the materials and dielectric collection
-        :return:
-        """
+            if item.get("piezo", False):
+                d.update(
+                    {
+                        "piezo": {},
+                        "warngings": [
+                            "Piezoelectric calculated for likely metal. Values are unlikely to be converged"
+                        ],
+                    }
+                )
 
-        # Search index for materials
-        self.materials.ensure_index(self.materials.key, unique=True)
-        self.materials.ensure_index("task_ids")
-
-        # Search index for dielectric
-        self.dielectric.ensure_index(self.dielectric.key, unique=True)
-        self.dielectric.ensure_index("task_ids")
+        return d
